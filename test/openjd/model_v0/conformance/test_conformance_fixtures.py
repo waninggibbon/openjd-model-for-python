@@ -45,16 +45,6 @@ _ALL_EXTENSIONS = [e.value for e in ExtensionName]
 # Fixture directories (relative to fixtures/) that this suite runs.
 _FIXTURE_DIRS = ["2023-09/STEP_APPROVALS/job_templates"]
 
-# Fixtures that contradict the normative specification text. The text and the RFC
-# win, so these are expected to fail until the fixture is corrected upstream.
-_SPEC_CONFLICTS = {
-    "2023-09/STEP_APPROVALS/job_templates/3.7--approval-with-script.yaml": (
-        "The fixture references {{Job.Name}} and {{Step.Name}} in an approval message "
-        "without listing the EXPR extension. Template Schemas §3.7.3 and RFC 0200 make "
-        "them available only with EXPR (as does the §7.3 built-in symbols table)."
-    ),
-}
-
 
 def _fixture_files() -> list[Path]:
     files: list[Path] = []
@@ -68,14 +58,7 @@ def _fixture_id(path: Path) -> str:
 
 
 def _fixture_params() -> list[Any]:
-    params = []
-    for path in _fixture_files():
-        fixture_id = _fixture_id(path)
-        marks = []
-        if fixture_id in _SPEC_CONFLICTS:
-            marks.append(pytest.mark.xfail(strict=True, reason=_SPEC_CONFLICTS[fixture_id]))
-        params.append(pytest.param(path, id=fixture_id, marks=marks))
-    return params
+    return [pytest.param(path, id=_fixture_id(path)) for path in _fixture_files()]
 
 
 def _decode(template: dict[str, Any]) -> Any:
