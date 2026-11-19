@@ -353,6 +353,16 @@ divergence flagged in §8.
   normalizing. openjd-specifications#191 (§2.2, §2.12) makes the v1
   behaviour normative, so v0 is the side to fix. Pinned as strict xfails in
   `test/openjd/model_v1/test_known_gaps.py`.
+* **`STEP_APPROVALS` (RFC 0200)** — v0 implements the extension
+  (`StepTemplate.approval`, approval-only Steps, `Step.approval` resolved at
+  job creation; `Step.script` is `None` for an approval-only Step). openjd-rs
+  has no such extension yet, so v1 rejects a template that lists it
+  (`Unsupported extension names: STEP_APPROVALS`) and has no `approval` field.
+  This is the reverse of the usual direction: the gap is on the binding side
+  and closes when openjd-rs gains the extension. `_V0_ONLY_EXTENSIONS` in
+  `test/openjd/model_v1/test_version_enums.py` exempts it from the
+  `ModelExtension` drift guard, and a strict xfail in
+  `test/openjd/model_v1/test_known_gaps.py` pins the gap.
 
 ## 6. Build and Test Results
 

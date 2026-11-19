@@ -5,11 +5,14 @@ from __future__ import annotations
 import re
 import secrets
 import string
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from graphlib import CycleError, TopologicalSorter
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, ClassVar, Literal, Optional, Type, Union, cast, Iterable
 from typing_extensions import Annotated, Self
+from urllib.parse import urlsplit
 
 from pydantic import (
     field_validator,
@@ -122,6 +125,9 @@ class ExtensionName(str, Enum):
     # Environment Wrap Actions (RFC 0008): onWrapEnvEnter/onWrapTaskRun/onWrapEnvExit
     # on <EnvironmentActions>. Requires EXPR.
     WRAP_ACTIONS = "WRAP_ACTIONS"
+    # Step Approvals (RFC 0200): the `approval` property of <StepTemplate>
+    # (<StepApproval>, Template Schemas §3.7), and approval-only Steps.
+    STEP_APPROVALS = "STEP_APPROVALS"
 
 
 ExtensionNameList = Annotated[list[str], Field(min_length=1)]
@@ -3504,8 +3510,381 @@ class HostRequirementsTemplate(OpenJDModel_v2023_09):
 
 
 # ==================================================================
+# ===================== Step approvals (RFC 0200) ==================
+# ==================================================================
+#
+# The STEP_APPROVALS extension: Template Schemas §3.7 `<StepApproval>`. The
+# Format Strings in an approval are resolved at job creation (§3.7.3), so the
+# StepApprovalTemplate/ApprovalLinkTemplate models below create as the
+# StepApproval/ApprovalLink models of the Job, which hold the resolved values
+# that a render management system shows to the approver.
+
+# §3.7 `links`: at most 10 elements.
+APPROVAL_LINKS_MAX = 10
+# §3.7.1 `<ApprovalMessage>`: the maximum length of the *resolved* message.
+APPROVAL_MESSAGE_MAX_LENGTH = 2048
+# §3.7.2 `label`: the maximum length of a link's label.
+APPROVAL_LINK_LABEL_MAX_LENGTH = 64
+# §3.7 `expiresAfterSeconds`: 60 seconds to 30 days.
+APPROVAL_EXPIRES_MIN_SECONDS = 60
+APPROVAL_EXPIRES_MAX_SECONDS = 2592000
+
+# All unicode except the [Cc] (control characters) category, plus CR, LF, and TAB.
+# Regex escapes rather than the characters themselves, so that the pattern reads
+# cleanly in the error for a message that does not match it.
+_approval_message_regex = f"(?-m:^(?:[^{_Cc_characters}]|[\\r\\n\\t])+\\Z)"
+_APPROVAL_URL_SCHEMES = ("http", "https")
+
+
+class ApprovalMessage(FormatString):
+    """`<ApprovalMessage>` (Template Schemas §3.7.1): the text shown to the approver.
+
+    The 2048-character maximum applies to the resolved value, so the template
+    checks it only for a message without expressions (StepApprovalTemplate), and
+    the Job checks the resolved message (StepApproval).
+    """
+
+    _min_length = 1
+    _regex = _approval_message_regex
+
+    def __new__(cls, value: str, *, context: ModelParsingContextInterface = ModelParsingContext()):
+        return super().__new__(cls, value, context=context)
+
+
+class ApprovalLinkUrl(FormatString):
+    """`<ApprovalLink>.url` (Template Schemas §3.7.2). After resolution it must be an
+    absolute URI whose scheme is http or https."""
+
+    _min_length = 1
+    # All unicode except the [Cc] (control characters) category
+    _regex = f"(?-m:^[^{_Cc_characters}]+\\Z)"
+
+    def __new__(cls, value: str, *, context: ModelParsingContextInterface = ModelParsingContext()):
+        return super().__new__(cls, value, context=context)
+
+
+class ApprovalLinkSubpath(FormatString):
+    """`<ApprovalLink>.subpath` (Template Schemas §3.7.2). After resolution it must be a
+    relative path without a `..` path segment."""
+
+    def __new__(cls, value: str, *, context: ModelParsingContextInterface = ModelParsingContext()):
+        return super().__new__(cls, value, context=context)
+
+
+ApprovalLinkLabel = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=APPROVAL_LINK_LABEL_MAX_LENGTH,
+        strict=True,
+        pattern=_standard_string_regex,
+    ),
+]
+ApprovalExpiresAfterSeconds = Annotated[
+    StrictInt, Field(ge=APPROVAL_EXPIRES_MIN_SECONDS, le=APPROVAL_EXPIRES_MAX_SECONDS)
+]
+
+
+class ApprovalOnReject(str, Enum):
+    """What happens when an approval request is rejected or expires (Template Schemas
+    §3.7 `onReject`). `FAIL`, the default, is the only value: the Step does not fully
+    complete successfully, and the Steps that depend on it are never scheduled."""
+
+    FAIL = "FAIL"
+
+
+def _validate_approval_url(value: str) -> None:
+    """§3.7.2: a link's resolved url must be an absolute URI whose scheme is http or
+    https.
+
+    Raises:
+        ValueError: if the value is not an absolute http or https URI.
+    """
+    error = ValueError(f"url must be an absolute URI whose scheme is http or https, not {value!r}.")
+    # A URI has no whitespace or control characters; a value that has them would
+    # not be shown to the approver as the link it claims to be.
+    if any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in value):
+        raise error
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+    except ValueError:
+        raise error from None
+    if parts.scheme.lower() not in _APPROVAL_URL_SCHEMES or not hostname:
+        raise error
+
+
+def _validate_approval_subpath(value: str) -> None:
+    """§3.7.2: a link's resolved subpath must not be an absolute path, and must not
+    contain a `..` path segment. Both POSIX and Windows forms are checked, since the
+    PATH parameter value it is appended to may be in either.
+
+    Raises:
+        ValueError: if the value is absolute or has a `..` segment.
+    """
+    if PurePosixPath(value).is_absolute() or PureWindowsPath(value).anchor:
+        raise ValueError(f"subpath must be a relative path, not {value!r}.")
+    if ".." in re.split(r"[/\\]", value):
+        raise ValueError(f"subpath must not contain a '..' path segment: {value!r}.")
+
+
+def _validate_link_target_choice(values: Any) -> Any:
+    """§3.7.2: exactly one of url or parameter, and subpath only with parameter."""
+    if not isinstance(values, dict):
+        # Not a mapping: the model's own validation reports it.
+        return values
+    has_url = values.get("url") is not None
+    has_parameter = values.get("parameter") is not None
+    if has_url and has_parameter:
+        raise ValueError("A link must provide exactly one of 'url' or 'parameter', not both.")
+    if not has_url and not has_parameter:
+        raise ValueError("A link must provide exactly one of 'url' or 'parameter'.")
+    if values.get("subpath") is not None and not has_parameter:
+        raise ValueError("'subpath' may only be provided with 'parameter'.")
+    return values
+
+
+# Target model for an ApprovalLinkTemplate when instantiating a job.
+class ApprovalLink(OpenJDModel_v2023_09):
+    """A resolved `<ApprovalLink>` of a Job's Step: a link that the render management
+    system shows to the approver. Exactly one of `url` or `parameter` is set.
+
+    Attributes:
+        label (str): The text shown for the link.
+        url (Optional[str]): The resolved http/https URL that the link targets.
+        parameter (Optional[str]): The name of the PATH Job Parameter that the link targets.
+        path (Optional[str]): The value of `parameter` as it was submitted (the
+            `RawParam.<name>` value). Path mapping is never applied to it.
+        subpath (Optional[str]): The resolved relative path appended to `path`.
+    """
+
+    label: ApprovalLinkLabel
+    url: Optional[str] = None
+    parameter: Optional[Identifier] = None
+    path: Optional[str] = None
+    subpath: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_target_choice(cls, values: Any) -> Any:
+        values = _validate_link_target_choice(values)
+        if isinstance(values, dict) and (values.get("parameter") is None) != (
+            values.get("path") is None
+        ):
+            raise ValueError("A link's 'path' is provided if and only if its 'parameter' is.")
+        return values
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            _validate_approval_url(v)
+        return v
+
+    @field_validator("subpath")
+    @classmethod
+    def _validate_subpath(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            _validate_approval_subpath(v)
+        return v
+
+    @property
+    def target(self) -> str:
+        """The link's full target, for display: `url`, or `path` with `subpath` appended.
+
+        `subpath` is joined with a backslash when `path` uses only backslashes as
+        separators (a Windows path), and with a forward slash otherwise.
+        """
+        if self.url is not None:
+            return self.url
+        path = self.path or ""
+        if not self.subpath:
+            return path
+        separator = "\\" if "\\" in path and "/" not in path else "/"
+        return path.rstrip("/\\") + separator + self.subpath
+
+
+def _approval_link_path(model: Any, symtab: SymbolTable) -> dict[str, Any]:
+    """Adds the `path` of a parameter link at job creation: the PATH parameter's value
+    as submitted (`RawParam.*`), with no path mapping (§3.7.2, §3.7.3)."""
+    parameter = getattr(model, "parameter", None)
+    if parameter is None:
+        return {}
+    return {
+        "path": str(symtab[f"{ValueReferenceConstants.JOB_PARAMETER_RAWPREFIX.value}.{parameter}"])
+    }
+
+
+class ApprovalLinkTemplate(OpenJDModel_v2023_09):
+    """`<ApprovalLink>` (Template Schemas §3.7.2): a link shown to the approver.
+
+    Exactly one of `url` or `parameter` must be provided, and `subpath` only with
+    `parameter`.
+
+    Attributes:
+        label (ApprovalLinkLabel): The text shown for the link.
+        url (Optional[ApprovalLinkUrl]): A Format String that resolves to an absolute
+            http or https URI.
+        parameter (Optional[Identifier]): The name of a PATH Job Parameter defined in the
+            same Job Template.
+        subpath (Optional[ApprovalLinkSubpath]): A Format String that resolves to a
+            relative path appended to the parameter's value.
+    """
+
+    label: ApprovalLinkLabel
+    url: Optional[ApprovalLinkUrl] = None
+    parameter: Optional[Identifier] = None
+    subpath: Optional[ApprovalLinkSubpath] = None
+
+    _job_creation_metadata = JobCreationMetadata(
+        create_as=JobCreateAsMetadata(model=ApprovalLink),
+        resolve_fields={"url", "subpath"},
+        adds_fields=_approval_link_path,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_target_choice(cls, values: Any) -> Any:
+        return _validate_link_target_choice(values)
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: Optional[ApprovalLinkUrl]) -> Optional[ApprovalLinkUrl]:
+        # A url with expressions is checked once it is resolved, at job creation.
+        if v is not None and len(v.expressions) == 0:
+            _validate_approval_url(v)
+        return v
+
+    @field_validator("subpath")
+    @classmethod
+    def _validate_subpath(cls, v: Optional[ApprovalLinkSubpath]) -> Optional[ApprovalLinkSubpath]:
+        # A subpath with expressions is checked once it is resolved, at job creation.
+        if v is not None and len(v.expressions) == 0:
+            _validate_approval_subpath(v)
+        return v
+
+
+ApprovalLinkTemplateList = Annotated[
+    list[ApprovalLinkTemplate], Field(min_length=1, max_length=APPROVAL_LINKS_MAX)
+]
+ApprovalLinkList = Annotated[list[ApprovalLink], Field(min_length=1, max_length=APPROVAL_LINKS_MAX)]
+
+
+# Target model for a StepApprovalTemplate when instantiating a job.
+class StepApproval(OpenJDModel_v2023_09):
+    """The resolved `<StepApproval>` of a Job's Step: a person must approve the Step
+    before any of its Tasks may be scheduled. Its Format Strings were resolved when the
+    Job was created, so it holds what the render management system shows the approver.
+
+    Attributes:
+        message (str): The resolved message, at most 2048 characters.
+        links (Optional[list[ApprovalLink]]): The resolved links, 1 to 10 if provided.
+        expiresAfterSeconds (Optional[int]): Seconds after the approval request opens at
+            which a request still waiting for a decision expires. None means that the
+            template sets no expiry.
+        onReject (Optional[ApprovalOnReject]): What a rejection or expiry does. None means
+            the default, `FAIL`.
+    """
+
+    message: str
+    links: Optional[ApprovalLinkList] = None
+    expiresAfterSeconds: Optional[ApprovalExpiresAfterSeconds] = None  # noqa: N815
+    onReject: Optional[ApprovalOnReject] = None  # noqa: N815
+
+    @field_validator("message")
+    @classmethod
+    def _validate_message(cls, v: str) -> str:
+        if len(v) < 1:
+            raise ValueError("message must not be empty")
+        if len(v) > APPROVAL_MESSAGE_MAX_LENGTH:
+            raise ValueError(
+                f"message must be at most {APPROVAL_MESSAGE_MAX_LENGTH} characters long once "
+                f"its Format Strings are resolved; it is {len(v)} characters long"
+            )
+        if not re.match(_approval_message_regex, v):
+            raise ValueError(
+                "message must not contain control characters other than newline, carriage "
+                "return, and horizontal tab"
+            )
+        return v
+
+
+class StepApprovalTemplate(OpenJDModel_v2023_09):
+    """`<StepApproval>` (Template Schemas §3.7, STEP_APPROVALS extension): a person must
+    approve the Step before any of its Tasks may be scheduled.
+
+    The Format Strings in the approval are resolved at job creation (§3.7.3). They may
+    reference `RawParam.*`, `Param.*` of non-PATH Job Parameters, and, with the EXPR
+    extension, `Job.Name` and `Step.Name`. The Step's `let` bindings are not in scope.
+
+    Attributes:
+        message (ApprovalMessage): The text shown to the approver.
+        links (Optional[ApprovalLinkTemplateList]): 1 to 10 links shown to the approver.
+        expiresAfterSeconds (Optional[int]): 60 to 2592000 seconds after the approval request
+            opens at which a request still waiting for a decision expires.
+        onReject (Optional[ApprovalOnReject]): Only `FAIL`, which is also the default.
+    """
+
+    message: ApprovalMessage
+    links: Optional[ApprovalLinkTemplateList] = None
+    expiresAfterSeconds: Optional[ApprovalExpiresAfterSeconds] = None  # noqa: N815
+    onReject: Optional[ApprovalOnReject] = None  # noqa: N815
+
+    # §3.7.3: Step.Name is in scope with the EXPR extension. It is defined here,
+    # rather than taken from the enclosing StepTemplate, because the StepTemplate's
+    # own symbols include its `let` bindings, which are not in scope.
+    _template_variable_definitions = DefinesTemplateVariables(expr_inject={"|Step.Name"})
+    _template_variable_sources = {
+        "message": {"__self__"},
+        "links": {"__self__"},
+    }
+    _job_creation_metadata = JobCreationMetadata(
+        create_as=JobCreateAsMetadata(model=StepApproval),
+        resolve_fields={"message"},
+    )
+
+    @field_validator("message")
+    @classmethod
+    def _validate_message_length(cls, v: ApprovalMessage) -> ApprovalMessage:
+        # A message with expressions is checked once it is resolved, at job creation.
+        if len(v.expressions) == 0 and len(v) > APPROVAL_MESSAGE_MAX_LENGTH:
+            raise ValueError(
+                f"message must be at most {APPROVAL_MESSAGE_MAX_LENGTH} characters long"
+            )
+        return v
+
+
+# ==================================================================
 # ========================== Template Types ========================
 # ==================================================================
+
+
+# Template Schemas §3: the properties that an approval-only Step must not have,
+# because they describe how a Step's Tasks run and an approval-only Step runs nothing.
+_APPROVAL_ONLY_STEP_DISALLOWED_FIELDS = (
+    "stepEnvironments",
+    "hostRequirements",
+    "parameterSpace",
+    "let",
+)
+
+
+def _validate_approval_only_step(values: dict[str, Any]) -> None:
+    """Template Schemas §3: an approval-only Step (an `approval`, and neither a
+    `script` nor a script interpreter) must not provide stepEnvironments,
+    hostRequirements, parameterSpace, or let.
+
+    Raises:
+        ValueError: if the Step provides any of them.
+    """
+    provided = [
+        name for name in _APPROVAL_ONLY_STEP_DISALLOWED_FIELDS if values.get(name) is not None
+    ]
+    if provided:
+        raise ValueError(
+            "An approval-only Step (one with 'approval' and no 'script' or script interpreter) "
+            f"must not have: {', '.join(provided)}."
+        )
 
 
 class StepDependency(OpenJDModel_v2023_09):
@@ -3518,8 +3897,15 @@ StepDependenciesList = Annotated[list[StepDependency], Field(min_length=1)]
 
 # Target model for a StepTemplate when instantiating a job.
 class Step(OpenJDModel_v2023_09):
+    """A Step of a Job, created from a StepTemplate.
+
+    With the STEP_APPROVALS extension, `script` is None for an approval-only Step
+    (see `is_approval_only`), and `approval` holds the resolved StepApproval of a Step
+    that a person must approve before any of its Tasks may be scheduled.
+    """
+
     name: StepName
-    script: StepScript
+    script: Optional[StepScript] = None
     description: Optional[Description] = None
     stepEnvironments: Optional[StepEnvironmentList] = None
     parameterSpace: Optional[StepParameterSpace] = None  # noqa: N815
@@ -3532,6 +3918,22 @@ class Step(OpenJDModel_v2023_09):
     # the step's symbol table (see create_job_with_symbol_tables), so they are
     # not merged into the script's own `let` for the runtime to re-evaluate.
     let: Optional[list[str]] = None
+    # STEP_APPROVALS (RFC 0200): the approval, with its Format Strings resolved
+    # at job creation.
+    approval: Optional[StepApproval] = None
+
+    @property
+    def is_approval_only(self) -> bool:
+        """Whether this is an approval-only Step (STEP_APPROVALS): it has an `approval`
+        and no `script`. It runs nothing on a Worker host, has no Session, and fully
+        completes successfully only when it is approved."""
+        return self.approval is not None and self.script is None
+
+    @model_validator(mode="after")
+    def _validate_script_or_approval(self) -> Self:
+        if self.script is None and self.approval is None:
+            raise ValueError("A Step must have a 'script', an 'approval', or both.")
+        return self
 
 
 class StepTemplate(OpenJDModel_v2023_09):
@@ -3555,6 +3957,10 @@ class StepTemplate(OpenJDModel_v2023_09):
         cmd (Optional[SimpleAction]): Windows cmd script syntax sugar (FEATURE_BUNDLE_1).
         powershell (Optional[SimpleAction]): PowerShell script syntax sugar (FEATURE_BUNDLE_1).
         node (Optional[SimpleAction]): Node.js script syntax sugar (FEATURE_BUNDLE_1).
+        let (Optional[list[str]]): Step-level `let` bindings (EXPR).
+        approval (Optional[StepApprovalTemplate]): A person must approve the Step before any
+            of its Tasks may be scheduled (STEP_APPROVALS). A Step with an approval and
+            neither a script nor a script interpreter is an approval-only Step.
     """
 
     name: StepName
@@ -3570,6 +3976,7 @@ class StepTemplate(OpenJDModel_v2023_09):
     powershell: Optional[SimpleAction] = None
     node: Optional[SimpleAction] = None
     let: Optional[list[str]] = None
+    approval: Optional[StepApprovalTemplate] = None
 
     # Step.Name is available to the step's script and step environments, but
     # only when the EXPR extension is enabled (RFC 0007).
@@ -3628,6 +4035,9 @@ class StepTemplate(OpenJDModel_v2023_09):
         "cmd": {"__self__", "parameterSpace"},
         "powershell": {"__self__", "parameterSpace"},
         "node": {"__self__", "parameterSpace"},
+        # "approval" is deliberately absent: §3.7.3 keeps the step's `let` names
+        # (part of __self__) out of an approval's scope. StepApprovalTemplate
+        # defines Step.Name for itself.
     }
     _job_creation_metadata = JobCreationMetadata(
         create_as=JobCreateAsMetadata(model=Step),
@@ -3667,6 +4077,13 @@ class StepTemplate(OpenJDModel_v2023_09):
                     "requires the FEATURE_BUNDLE_1 extension."
                 )
 
+        # STEP_APPROVALS (RFC 0200): `approval` requires the extension, and makes
+        # `script` optional.
+        has_approval = values.get("approval") is not None
+        approvals_enabled = bool(context and "STEP_APPROVALS" in context.extensions)
+        if has_approval and context and not approvals_enabled:
+            raise ValueError("The 'approval' field requires the STEP_APPROVALS extension.")
+
         # Must have exactly one of: script or an interpreter
         if has_script and has_interpreter:
             raise ValueError(
@@ -3674,10 +4091,18 @@ class StepTemplate(OpenJDModel_v2023_09):
                 "(python, bash, cmd, powershell, node)."
             )
         if not has_script and not has_interpreter:
-            raise ValueError(
-                "Must specify either 'script' or a script interpreter "
-                "(python, bash, cmd, powershell, node)."
-            )
+            if has_approval:
+                _validate_approval_only_step(values)
+            elif approvals_enabled:
+                raise ValueError(
+                    "Must specify 'script', a script interpreter "
+                    "(python, bash, cmd, powershell, node), or 'approval'."
+                )
+            else:
+                raise ValueError(
+                    "Must specify either 'script' or a script interpreter "
+                    "(python, bash, cmd, powershell, node)."
+                )
         if interpreter_count > 1:
             raise ValueError(
                 "Cannot specify multiple script interpreters. "
@@ -3717,6 +4142,16 @@ class StepTemplate(OpenJDModel_v2023_09):
         if any(dep.dependsOn == stepname for dep in deps):
             raise ValueError("A step cannot depend upon itself.")
         return self
+
+    @property
+    def is_approval_only(self) -> bool:
+        """Whether this is an approval-only Step (STEP_APPROVALS): it has an `approval`,
+        and neither a `script` nor a script interpreter (FEATURE_BUNDLE_1)."""
+        return (
+            self.approval is not None
+            and self.script is None
+            and all(getattr(self, name) is None for name in _INTERPRETER_MAP)
+        )
 
     def resolve_syntax_sugar(self) -> "StepTemplate":
         """Transform interpreter syntax sugar into equivalent script + embeddedFiles.
@@ -3795,6 +4230,7 @@ class StepTemplate(OpenJDModel_v2023_09):
             # Preserved for the runtime to seed when entering the step's
             # environments (RFC 0007).
             let=self.let,
+            approval=self.approval,
         )
 
 
@@ -4503,6 +4939,44 @@ class JobTemplate(OpenJDModel_v2023_09):
                                 input=dep.dependsOn,
                             )
                         )
+
+        if errors:
+            raise ValidationError.from_exception_data(self.__class__.__name__, errors)
+
+        return self
+
+    @model_validator(mode="after")
+    def _validate_approval_link_parameters(self) -> Self:
+        # STEP_APPROVALS (Template Schemas §3.7.2): a link's `parameter` names a
+        # Job Parameter of type PATH that is defined in this Job Template.
+        parameter_types = {param.name: param.type for param in (self.parameterDefinitions or [])}
+        errors = list[InitErrorDetails]()
+        for i, step in enumerate(self.steps or []):
+            if step.approval is None:
+                continue
+            for j, link in enumerate(step.approval.links or []):
+                if link.parameter is None:
+                    continue
+                param_type = parameter_types.get(link.parameter)
+                if param_type is None:
+                    message = (
+                        f"Job parameter '{link.parameter}' is not defined in the Job Template."
+                    )
+                elif param_type != JobParameterType.PATH:
+                    message = (
+                        f"Job parameter '{link.parameter}' must be of type PATH to be the target "
+                        f"of an approval link; it is of type {JobParameterType(param_type).value}."
+                    )
+                else:
+                    continue
+                errors.append(
+                    InitErrorDetails(
+                        type="value_error",
+                        loc=("steps", i, "approval", "links", j, "parameter"),
+                        ctx={"error": ValueError(message)},
+                        input=link.parameter,
+                    )
+                )
 
         if errors:
             raise ValidationError.from_exception_data(self.__class__.__name__, errors)

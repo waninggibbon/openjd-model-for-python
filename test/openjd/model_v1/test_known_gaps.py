@@ -93,3 +93,33 @@ def test_v0_joins_list_path_defaults_to_the_template_directory() -> None:
 def test_v0_normalizes_a_relative_submitted_path() -> None:
     out = _v0_preprocess({"name": "P", "type": "PATH"}, {"P": "sub/../other"})
     assert out["P"] == "/tmp/cwd/other"
+
+
+# ── v1 has no STEP_APPROVALS (RFC 0200) ──
+#
+# The pure-Python model (v0) implements the STEP_APPROVALS extension: the
+# ``approval`` property of a Step Template (Template Schemas §3.7) and
+# approval-only Steps. openjd-rs does not have it yet, so the binding rejects
+# the ``approval`` field. ``_V0_ONLY_EXTENSIONS`` in ``test_version_enums.py``
+# lists the extension until openjd-rs gains it; the v0 side is pinned by
+# ``test/openjd/model_v0/v2023_09/test_step_approvals.py`` and the conformance
+# fixtures in ``test/openjd/model_v0/conformance/``.
+
+_V1_STEP_APPROVALS_GAP = "openjd-rs has no STEP_APPROVALS extension (RFC 0200)"
+
+
+@pytest.mark.xfail(strict=True, reason=_V1_STEP_APPROVALS_GAP)
+def test_v1_decodes_an_approval_only_step() -> None:
+    from openjd.model._v1 import decode_job_template
+
+    template = decode_job_template(
+        template={
+            "specificationVersion": "jobtemplate-2023-09",
+            "extensions": ["STEP_APPROVALS"],
+            "name": "Job",
+            "steps": [{"name": "Review", "approval": {"message": "Approve?"}}],
+        },
+        supported_extensions=["STEP_APPROVALS"],
+    )
+
+    assert template.steps[0].name == "Review"

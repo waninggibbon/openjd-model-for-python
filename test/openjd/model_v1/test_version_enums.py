@@ -60,6 +60,14 @@ class TestTemplateSpecificationVersion:
         assert t.specification_version.value == "jobtemplate-2023-09"
 
 
+# Extensions that the pure-Python model (v0) implements but openjd-rs, and so
+# the binding, does not have yet. Each is a documented gap with an xfail test in
+# test_known_gaps.py; remove the name here when openjd-rs gains the extension.
+#   STEP_APPROVALS (RFC 0200): prototyped in v0 first.
+_V0_ONLY_EXTENSIONS = {"STEP_APPROVALS"}
+_SHARED_EXTENSIONS = sorted({e.value for e in ExtensionName} - _V0_ONLY_EXTENSIONS)
+
+
 def _rust_extension_members() -> set[str]:
     # `ModelExtension` is a PyO3 pyclass enum, not a real `enum.Enum`, so
     # it is not iterable. Discover members by identity instead of relying
@@ -92,9 +100,16 @@ class TestModelExtension:
         # set of 2023-09 extensions. Divergence in either direction is a
         # bug: a missing member means the catch-all aliases it to the
         # wrong extension; an extra member means Python cannot name it.
-        assert _rust_extension_members() == {e.value for e in ExtensionName}
+        # The only exception is a documented v0-only extension.
+        assert _rust_extension_members() == set(_SHARED_EXTENSIONS)
 
-    @pytest.mark.parametrize("name", [e.value for e in ExtensionName])
+    def test_v0_only_extensions_are_still_missing_from_the_binding(self) -> None:
+        # When openjd-rs gains one of these, this fails: drop it from
+        # _V0_ONLY_EXTENSIONS and promote its test_known_gaps.py xfail.
+        assert _V0_ONLY_EXTENSIONS <= {e.value for e in ExtensionName}
+        assert not _V0_ONLY_EXTENSIONS & _rust_extension_members()
+
+    @pytest.mark.parametrize("name", _SHARED_EXTENSIONS)
     def test_name_round_trips_to_its_own_member(self, name: str) -> None:
         # Catches aliasing directly, independent of member-set equality:
         # every spec name must parse back to the member of the same name,
